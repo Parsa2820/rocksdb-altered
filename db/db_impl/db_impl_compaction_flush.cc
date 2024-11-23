@@ -9,6 +9,8 @@
 #include "db/db_impl/db_impl.h"
 
 #include <cinttypes>
+#include <iostream>
+#include <fstream>
 
 #include "db/builder.h"
 #include "db/error_handler.h"
@@ -2722,6 +2724,43 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     env_->Schedule(&DBImpl::BGWorkBottomCompaction, ca, Env::Priority::BOTTOM,
                    this, &DBImpl::UnscheduleCompactionCallback);
   } else {
+    bool offload = true;
+    std::string offload_filename = "offload-" + std::to_string(job_context->job_id);
+
+    if(offload) {
+      // Record necessary compaction offloading details
+      std::ofstream f;
+      f.open (offload_filename + ".req");
+      f << c->output_level() << " ";
+      char formatted[24];
+      for (auto input: *(c->inputs())) {
+        for (auto file: input.files) {
+          sprintf(formatted, "%06" PRIu64 ".sst", file->fd.GetNumber());
+          f << formatted << " ";
+        }
+      }
+      f << std::endl;
+      f.close();
+
+      // Unmark files (allowing remote compaction)
+      c->ReleaseCompactionFiles(Status());
+
+      mutex_.Unlock();
+
+      // Wait for corresponding .done file indicating compaction is done
+      while( access( (offload_filename + ".done").c_str(), F_OK ) == -1 ) {
+        usleep(100);
+        std::cout << "Offloading " << offload_filename << " not yet done! Waiting..." << std::endl;
+      }
+
+      // Compaction done
+      std::cout << "Offloading " << offload_filename << " done! Installing..." << std::endl;
+
+      // Mark files (reverting remote compaction status)
+      c->MarkFilesBeingCompacted(true);
+      mutex_.Lock();
+    }
+
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:BeforeCompaction",
                              c->column_family_data());
     int output_level __attribute__((__unused__));
@@ -2745,16 +2784,21 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         c->mutable_cf_options()->report_bg_io_stats, dbname_,
         &compaction_job_stats, thread_pri,
         is_manual ? &manual_compaction_paused_ : nullptr);
-    compaction_job.Prepare();
 
-    NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
-                            compaction_job_stats, job_context->job_id);
+    if(offload) {
+      mutex_.Unlock();
+    } else {
+      compaction_job.Prepare();
 
-    mutex_.Unlock();
-    TEST_SYNC_POINT_CALLBACK(
-        "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun", nullptr);
-    compaction_job.Run();
-    TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
+      NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
+                              compaction_job_stats, job_context->job_id);
+
+      mutex_.Unlock();
+      TEST_SYNC_POINT_CALLBACK(
+              "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun", nullptr);
+      compaction_job.Run();
+      TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
+    }
     mutex_.Lock();
 
     status = compaction_job.Install(*c->mutable_cf_options());
@@ -2763,6 +2807,12 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                                          &job_context->superversion_contexts[0],
                                          *c->mutable_cf_options());
     }
+
+    if (offload) {
+      remove((offload_filename + ".req").c_str());
+      remove((offload_filename + ".done").c_str());
+    }
+
     *made_progress = true;
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:AfterCompaction",
                              c->column_family_data());
