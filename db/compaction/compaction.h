@@ -293,10 +293,10 @@ class Compaction {
 
   uint64_t MinInputFileCreationTime() const;
 
- private:
   // mark (or clear) all files that are being compacted
   void MarkFilesBeingCompacted(bool mark_as_compacted);
 
+ private:
   // get the smallest and largest key present in files to be compacted
   static void GetBoundaryKeys(VersionStorageInfo* vstorage,
                               const std::vector<CompactionInputFiles>& inputs,
